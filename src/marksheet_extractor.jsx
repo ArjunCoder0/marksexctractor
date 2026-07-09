@@ -2,128 +2,158 @@ import { useState, useCallback } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).href;
 
-const GROQ_ENDPOINT = "/api/groq/openai/v1/chat/completions";
-const GROQ_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct";
-const BATCH_SIZE    = 1; // 1 page per call — prevents multi-page confusion
-const MAX_RETRIES   = 4;
-const RETRYABLE_STATUS = new Set([408, 500, 502, 503, 504]);
-const TEXT_SUBJECT_CODES = ["SE201CS", "SE202CS", "SE203CS", "SE204CS", "SE205CS", "SE206CS", "SE207CS", "SE208CS"];
+// â”€â”€â”€ API CONFIG â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const GROQ_ENDPOINT     = "/api/groq/openai/v1/chat/completions";
+const GROQ_MODEL        = "meta-llama/llama-4-scout-17b-16e-instruct";
+const BATCH_SIZE        = 1;   // 1 page per API call â€” avoids multi-page confusion
+const MAX_RETRIES       = 4;
+const RETRYABLE_STATUS  = new Set([408, 500, 502, 503, 504]);
 
-// Derive subject codes dynamically from whatever the AI extracted
-function getSubjectCodes(rows) {
-  const codes = new Set();
-  rows.forEach(row => {
-    Object.keys(row).forEach(k => {
-      const m = k.match(/^(.+)_(UA|CA|Total)$/);
-      if (m) codes.add(m[1]);
-    });
-  });
-  return [...codes].sort();
-}
-
-function buildColumns(subjectCodes) {
-  return [
-    { key: "rollNo",     label: "Roll No" },
-    { key: "name",       label: "Name" },
-    { key: "motherName", label: "Mother Name" },
-    ...subjectCodes.flatMap(c => [
-      { key: `${c}_UA`,    label: `${c}_UA`    },
-      { key: `${c}_CA`,    label: `${c}_CA`    },
-      { key: `${c}_Total`, label: `${c}_Total` },
-    ]),
-    { key: "finalTotal", label: "Final Total" },
-    { key: "sgpa",       label: "SGPA" },
-    { key: "result",     label: "Result" },
-  ];
-}
-
+// â”€â”€â”€ UTILITY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function parseResponseBody(res) {
   const raw = await res.text();
   if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return { error: { message: raw.slice(0, 300) } };
-  }
+  try { return JSON.parse(raw); }
+  catch { return { error: { message: raw.slice(0, 300) } }; }
 }
 
-function parseTextMarksheet(fullText) {
-  const text = fullText.replace(/\s+/g, " ");
-  const starts = [...text.matchAll(/\s(69\d{5})\s+\d+\s+(20\d{13,16})\s+/g)];
-  const students = [];
+// â”€â”€â”€ UNIVERSAL AI PROMPT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Completely generic â€” no mention of any specific semester, branch, subject codes,
+// or subject count. The AI discovers everything from the image.
 
-  for (let i = 0; i < starts.length; i++) {
-    const start = starts[i].index;
-    const end = i + 1 < starts.length ? starts[i + 1].index : text.length;
-    const block = text.slice(start, end).replace(/\s+/g, " ");
-    const head = block.match(/^\s*(69\d{5})\s+\d+\s+(20\d{13,16})\s+(.+?)\s*311\s+\d+\s+([MF])\s+E/);
-    if (!head) continue;
+const PROMPT = `You are a precise data extractor for Gondwana University tabulation register marksheets.
+The image is ONE PAGE of a printed result register. Extract ALL student records visible on this page.
 
-    const nameParts = head[3].trim().split(" ");
-    const motherName = nameParts.pop() || "";
-    const row = {
-      rollNo: head[1],
-      name: nameParts.join(" "),
-      motherName,
-    };
+--- PAGE STRUCTURE ---
 
-    const scorePairs = [...block.matchAll(/\|\s*([0-9A-Z]+)\|\s*([0-9A-Z]+)\|\s*-/g)]
-      .slice(0, TEXT_SUBJECT_CODES.length)
-      .map(m => [m[1], m[2]]);
+The top of the page shows university name, college, course, semester, result date.
+A column-header row lists subject numbers: 1(Th), 2(Th), 3(Pr), etc.
+A sub-header row shows: UA/CA/UA:TOT and CR|GI|GI|GPV for each subject.
 
-    const totalsMatch = block.match(/\|\s*20\s*\|\s*\|\s*\|([\s\S]+?)\|\s*4\s*\|/);
-    const totalFields = totalsMatch
-      ? totalsMatch[1].split("|").map(v => v.trim()).filter(Boolean)
-      : [];
+Each student occupies EXACTLY 5 lines:
 
-    TEXT_SUBJECT_CODES.forEach((code, idx) => {
-      row[`${code}_UA`] = scorePairs[idx]?.[0] || "";
-      row[`${code}_CA`] = scorePairs[idx]?.[1] || "";
-      row[`${code}_Total`] = totalFields[idx]?.split(/\s+/)[0] || "";
-    });
+  LINE 1 (IDENTITY):
+    SerialNo  PRN  NAME-OF-CANDIDATE  MOTHERS_NAME  CEN CAT GENDER ...
+    PRN is 7 to 17 digits. Use the FULL number as rollNo.
 
-    row.finalTotal = totalFields[8]?.split(/\s+/)[0] || "";
-    row.sgpa = (block.match(/\|\s*([0-9]+\.[0-9]+)\s*\|\s*\|\s*\|\s*SE201CS/) || [])[1] || "";
-    row.result = (totalFields[10] || "").trim();
+  LINE 2 (MAX MARKS -- ALWAYS IGNORE):
+    | 80:20/40 | 80:20/40 | :25/25 | :50/50 |
+    KEY: contains colon ':' inside pipe cells.
+    These are maximum marks, NOT student scores. NEVER extract from this line.
 
-    students.push(row);
-  }
+  LINE 3 (RAW SCORES -- EXTRACT UA AND CA FROM HERE):
+    | 066| 019|  -|  | 041| 045|  -|  | 023| 024|  -|
+    KEY: NO colon ':' inside the pipes. Only digits, 0AB, EC, or dash.
+    For each subject group  | UA | CA | - | :
+      - First number  = UA mark (university assessment)  --> use as <CODE>_UA
+      - Second number = CA mark (continuous assessment)  --> use as <CODE>_CA
+      - The dash -    = placeholder only, NOT absent -- ignore it
+    Special values: '0AB' = absent. 'EC'/'EUC' = exempted. Use them as strings.
 
-  const meta = {
-    university: (fullText.match(/GONDWANA UNIVERSITY,\s*GADCHIROLI/i) || [])[0] || "",
-    course: (fullText.match(/B\.TECH\.\(with credits\).*?SEM IV/i) || [])[0]?.replace(/\s+/g, " ") || "",
-    semester: "SEM IV",
-    examDate: (fullText.match(/RESULT DATE:([0-9-]+)/i) || [])[1] || "",
-    college: (fullText.match(/COLLEGE CODE & NAME\s*:\s*(.+?)\s*-{5,}/i) || [])[1]?.replace(/\s+/g, " ").trim() || "",
-  };
+  LINE 4 (GRADE/CREDIT -- IGNORE FOR MARKS):
+    | 4 |A+|10|40|  | 4 |B+|18|32| ...
+    Credits and grade points, NOT raw marks.
 
-  return { meta, students };
-}
+  LINE 5 (TOTALS + RESULT):
+    | 85 | 86 | 82 | 91 | 47 | 49 | 87 | 48 |   635 | 232 | PASS
+    - Numbers before grand total = subject total per subject (UA+CA sum).
+    - Large number near end = finalTotal (grand sum).
+    - Decimal like 9.67 = SGPA.
+    - Last word = result (PASS / FAIL / ATKT / PASS BY GRACE / ABSENT).
 
-async function extractTextMarksheet(buffer) {
-  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
-  let text = "";
+Subject codes appear below each column at the bottom of the block:
+  TE201CS  TE202CS  TE203CS  ...
+  Use these EXACT codes as JSON key prefixes.
 
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    text += ` ${content.items.map(item => item.str).join(" ")} `;
-  }
+--- HOW TO TELL LINE 2 FROM LINE 3 ---
 
-  return parseTextMarksheet(text);
-}
+  MAX MARKS (LINE 2) -- has colon ':' in pipes --> IGNORE
+    Example: | 80:20/40 |  or  | :25/25 |
 
+  RAW SCORES (LINE 3) -- no colon in pipes --> EXTRACT
+    Example: | 066| 019|  -|   --> UA=066, CA=019, dash ignored
+
+Concrete example for theory subject TE201CS:
+  LINE 2 (ignore):  | 80:20/40 |      <- colon = max marks
+  LINE 3 (extract): | 066| 019|  -|   <- no colon, UA=066, CA=019
+  LINE 5 (extract): | 85 |            <- total = 85
+
+Concrete example for practical subject TE206CS:
+  LINE 2 (ignore):  | :25/25 |        <- colon = max marks
+  LINE 3 (extract): | 023| 024|  -|   <- no colon, UA=023, CA=024
+  LINE 5 (extract): | 47 |            <- total = 47
+
+--- SUBJECT CODE RULES ---
+
+  - Read EXACT codes from bottom of each column (e.g. TE201CS, SE401CS).
+  - Any number of subjects is possible (4 to 12).
+  - Use ONLY the alphanumeric code: no hyphens, no leading digits, no spaces.
+    CORRECT: "TE201CS_UA"
+    WRONG:   "TE201CS-I_UA", "1.TE201CS_UA", "TE201CS_I_UA"
+  - If the PDF shows "TE203CS-I", strip the "-I" and use "TE203CS".
+
+--- STUDENT FIELD RULES ---
+
+  rollNo      : full PRN number from LINE 1 (7-17 digits)
+  name        : all name words except the last (mother's name)
+  motherName  : last word of the name cluster on LINE 1
+  <CODE>_UA   : UA mark (string) from LINE 3
+  <CODE>_CA   : CA mark (string) from LINE 3
+  <CODE>_Total: subject total (string) from LINE 5
+  finalTotal  : grand total from LINE 5 (NOT max marks)
+  sgpa        : decimal string like "9.67"
+  result      : "PASS", "FAIL", "ATKT", "PASS BY GRACE", or "ABSENT"
+
+--- RULES ---
+
+  1. Extract EVERY student on the page -- skip none.
+  2. Subject codes come ONLY from the printed column footers -- never invent.
+  3. finalTotal is the student grand total -- NOT the max marks total.
+  4. SGPA appears once per student.
+  5. Do NOT put grade letters (A+, B, C+), credits, or exemption notes into marks fields.
+  6. Return {"meta":{},"students":[]} if this page has no student records.
+  7. Return ONLY valid JSON -- no markdown, no comments, no explanations.
+
+--- REQUIRED JSON OUTPUT ---
+
+Return ONLY valid JSON in this exact shape:
+
+{
+  "meta": {
+    "university": "...",
+    "course": "...",
+    "semester": "...",
+    "examDate": "...",
+    "college": "...",
+    "branch": "..."
+  },
+  "students": [
+    {
+      "rollNo": "2022033700259876",
+      "name": "BALBUDDHE TRUPTI YADAV",
+      "motherName": "PUSHPHA",
+      "TE201CS_UA": "066",
+      "TE201CS_CA": "019",
+      "TE201CS_Total": "85",
+      "TE202CS_UA": "041",
+      "TE202CS_CA": "045",
+      "TE202CS_Total": "86",
+      "TE206CS_UA": "023",
+      "TE206CS_CA": "024",
+      "TE206CS_Total": "47",
+      "finalTotal": "635",
+      "sgpa": "9.67",
+      "result": "PASS"
+    }
+  ]
+}`;
+// â”€â”€â”€ JSON CLEANING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function stripJsonComments(input) {
-  let out = "";
-  let inString = false;
-  let escaped = false;
-
+  let out = "", inString = false, escaped = false;
   for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-    const next = input[i + 1];
-
+    const ch = input[i], next = input[i + 1];
     if (inString) {
       out += ch;
       if (escaped) escaped = false;
@@ -131,150 +161,197 @@ function stripJsonComments(input) {
       else if (ch === '"') inString = false;
       continue;
     }
-
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      continue;
-    }
-
-    if (ch === "/" && next === "/") {
-      while (i < input.length && input[i] !== "\n") i++;
-      out += "\n";
-      continue;
-    }
-
-    if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i++;
-      i++;
-      continue;
-    }
-
+    if (ch === '"') { inString = true; out += ch; continue; }
+    if (ch === "/" && next === "/") { while (i < input.length && input[i] !== "\n") i++; out += "\n"; continue; }
+    if (ch === "/" && next === "*") { i += 2; while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i++; i++; continue; }
     out += ch;
   }
-
   return out;
 }
 
 function extractJsonCandidate(raw) {
-  const fencedJson = raw.match(/```json\s*([\s\S]*?)```/i);
-  if (fencedJson) return fencedJson[1];
-
+  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1];
   const first = raw.indexOf("{");
   if (first === -1) return "";
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
+  let depth = 0, inStr = false, esc = false;
   for (let i = first; i < raw.length; i++) {
     const ch = raw[i];
-
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-
-    if (ch === '"') inString = true;
-    else if (ch === "{") depth += 1;
-    else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) return raw.slice(first, i + 1);
-    }
+    if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return raw.slice(first, i + 1); }
   }
-
   return raw.slice(first);
 }
 
-const PROMPT = `Extract data from the attached marksheet image. The image is attached in this same message.
+function cleanJSON(raw) {
+  return stripJsonComments(extractJsonCandidate(raw))
+    .replace(/```json\s*/gi, "").replace(/```\s*/g, "")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/([{,]\s*)'([^']+)'\s*:/g, '$1"$2":')
+    .replace(/([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*:/g, '$1"$2":')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .trim();
+}
 
-You are a precise data extractor for Gondwana University tabulation register marksheets.
+// â”€â”€â”€ SCHEMA NORMALIZER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-This PDF uses a SPECIFIC MULTI-LINE FORMAT per student. Each student block has EXACTLY these lines:
-LINE 1 (MAX MARKS HEADER): Shows maximum marks like "|80/20/40|" or "|80/20/40|" — DO NOT USE THESE, they are NOT student scores.
-LINE 2 (STUDENT RAW SCORES): Shows the student's actual raw scores like "|066| 014|  -|" separated by | pipes. These are the REAL UA and CA values.
-LINE 3 (GRADE/CREDIT LINE): Shows letter grades and credits like "4(A+)|10|40" — ignore this line for marks.
-LINE 4 (SUBJECT CODE LINE): Shows the subject codes like "SE201CS SE202CS SE203CS..." — use these as column headers.
-LINE 5 (TOTALS/FINAL): Shows computed subject totals separated by | like "80|46|50|63|44|33| |43" — use these as Total per subject.
+/**
+ * Normalize ANY subject key the AI might return into a canonical form.
+ *
+ * The AI sometimes returns inconsistent key names across pages for the same
+ * subject. Examples observed:
+ *   "BE203CS_UA"       â†’ OK as-is
+ *   "BE203CS-I_UA"     â†’ hyphen + letter suffix â†’ strip to "BE203CS_UA"
+ *   "BE203CS_I_UA"     â†’ underscore + letter suffix â†’ strip to "BE203CS_UA"
+ *   "1.BE203CS_UA"     â†’ leading number prefix â†’ strip to "BE203CS_UA"
+ *   "1 BE203CS_Total"  â†’ leading number+space â†’ strip to "BE203CS_Total"
+ *
+ * Strategy:
+ *   1. Find the LAST occurrence of _UA / _CA / _Total (the real suffix).
+ *   2. Everything before it is the "raw code" prefix.
+ *   3. From the raw code, extract the FIRST token matching university code
+ *      pattern: 2â€“4 uppercase letters + 3 digits + 0â€“3 uppercase letters.
+ *   4. Combine: normalized_code + _ + suffix â†’ canonical key.
+ *
+ * Non-subject keys (rollNo, name, etc.) pass through unchanged.
+ */
+function sanitizeStudentKeys(student) {
+  const SUFFIX_RE = /_(UA|CA|Total)$/i;
+  const CODE_RE   = /([A-Z]{2,4}\d{3}[A-Z]{0,3})/i;
 
-CRITICAL RULES:
-1. NEVER use values from LINE 1 (the max marks like 80, 20/40, etc.) as student scores.
-2. LINE 2 contains the actual UA and CA raw scores — these are what you MUST extract.
-3. If a subject shows "EC", "EUC", "EU" or "-" it means Exempted — record "EC" as the value.
-4. The TOTAL for each subject = UA + CA (from line 2). The last row of the student block shows the computed totals.
-5. Each student has a 4-digit or 7-digit roll number (PRN) and a serial number (1,2,3...). Use the serial number as rollNo unless a full PRN like 6922071 is available — then use that.
-6. Extract EVERY student on the page — do not skip any.
-7. The subject layout per student (reading the | separated columns left to right) maps to: Subject 1 (UA|CA|TOT), Subject 2 (UA|CA|TOT), ..., Subject N (UA|CA|TOT).
-8. finalTotal is the sum printed at the end of the student row (e.g., 394, 87, 452, 441, etc.) — NOT 800 or any maximum.
-9. result is exactly as printed: "PASS", "FAIL", "PASS BY GRACE", "ATKT", etc.
-
-For the subject codes: look at the bottom row of the table header area. They appear as codes like SE201CS, SE202CS, SE203CS, SE204CS, SE205CS, SE206CS, SE207CS, SE208CS or similar. Use the EXACT codes printed.
-
-Return ONLY valid JSON. Do not write markdown, explanations, assumptions, code snippets, or comments. JSON does not allow // comments.
-If a field is unreadable, use an empty string. If no student records are readable from the attached image, return {"meta":{},"students":[]} and nothing else.
-
-Required JSON shape:
-{
-  "meta": {"university":"...","course":"...","semester":"...","examDate":"...","college":"..."},
-  "students": [
-    {
-      "rollNo":"6922071",
-      "name":"AKASH GAJANAN SAHU",
-      "motherName":"SANGITA",
-      "SE201CS_UA":"66", "SE201CS_CA":"14", "SE201CS_Total":"80",
-      "SE202CS_UA":"31", "SE202CS_CA":"15", "SE202CS_Total":"46",
-      "SE203CS_UA":"40", "SE203CS_CA":"10", "SE203CS_Total":"50",
-      "SE204CS_UA":"49", "SE204CS_CA":"14", "SE204CS_Total":"63",
-      "SE205CS_UA":"31", "SE205CS_CA":"13", "SE205CS_Total":"44",
-      "SE206CS_UA":"17", "SE206CS_CA":"16", "SE206CS_Total":"33",
-      "SE207CS_UA":"EC", "SE207CS_CA":"EC", "SE207CS_Total":"EC",
-      "SE208CS_UA":"21", "SE208CS_CA":"22", "SE208CS_Total":"43",
-      "finalTotal":"394", "sgpa":"6.90", "result":"PASS"
+  const clean = {};
+  for (const [k, v] of Object.entries(student)) {
+    const suffixMatch = k.match(SUFFIX_RE);
+    if (suffixMatch) {
+      // Everything before the last _UA/_CA/_Total
+      const rawCode = k.slice(0, k.length - suffixMatch[0].length);
+      const codeMatch = rawCode.match(CODE_RE);
+      if (codeMatch) {
+        // Canonical suffix: UA stays UA, CA stays CA, total/Total/TOTAL → Total
+        const s = suffixMatch[1].toUpperCase();
+        const canonSuffix = s === "TOTAL" ? "Total" : s; // UA | CA | Total
+        const normKey = `${codeMatch[1].toUpperCase()}_${canonSuffix}`;
+        // Merge: non-empty wins if this key already exists from another variant
+        if (!(normKey in clean) || (clean[normKey] ?? "").toString().trim() === "") {
+          clean[normKey] = v;
+        }
+        continue;
+      }
     }
-  ]
-}`;
+    // Not a subject key â€” pass through (rollNo, name, motherName, finalTotal, sgpa, result)
+    clean[k] = v;
+  }
+  return clean;
+}
 
+// After all batches merge:
+//  1. Sanitize subject-code key names (strip AI noise like leading digits)
+//  2. Collect all unique keys across all students
+//  3. Merge duplicate rollNo records â€” NON-EMPTY value always wins
+//     (prevents a partial page-2 record from wiping a complete page-1 record)
+//  4. Fill every missing key with "" so CSV has uniform columns
+function normalizeStudents(students) {
+  const sanitized = students.map(sanitizeStudentKeys);
+
+  const allKeys = new Set();
+  sanitized.forEach(s => Object.keys(s).forEach(k => allKeys.add(k)));
+
+  // Merge-deduplicate: non-empty value always wins over empty
+  const byRoll = new Map();
+  sanitized.forEach(s => {
+    const key = (s.rollNo || "").toString().trim() || `__no_roll_${Math.random()}`;
+    if (!byRoll.has(key)) {
+      byRoll.set(key, { ...s });
+    } else {
+      const existing = byRoll.get(key);
+      for (const [k, v] of Object.entries(s)) {
+        const newVal = (v ?? "").toString().trim();
+        const oldVal = (existing[k] ?? "").toString().trim();
+        if (newVal !== "" && oldVal === "") existing[k] = v;
+      }
+    }
+  });
+
+  return [...byRoll.values()].map(s => {
+    const filled = {};
+    ["rollNo", "name", "motherName"].forEach(k => { filled[k] = s[k] ?? ""; });
+    [...allKeys]
+      .filter(k => /^.+_(UA|CA|Total)$/.test(k))
+      .sort()
+      .forEach(k => { filled[k] = s[k] ?? ""; });
+    ["finalTotal", "sgpa", "result"].forEach(k => { filled[k] = s[k] ?? ""; });
+    return filled;
+  });
+}
+
+// â”€â”€â”€ DYNAMIC COLUMN BUILDER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Derives subject codes from whatever keys actually exist in the data.
+// Zero assumptions about count, names, or semester.
+function getSubjectCodes(rows) {
+  const codes = new Set();
+  rows.forEach(row =>
+    Object.keys(row).forEach(k => {
+      const m = k.match(/^(.+)_(UA|CA|Total)$/);
+      if (m) codes.add(m[1]);
+    })
+  );
+  return [...codes].sort();
+}
+
+function buildColumns(subjectCodes) {
+  return [
+    { key: "rollNo",     label: "Roll No"     },
+    { key: "name",       label: "Name"         },
+    { key: "motherName", label: "Mother Name"  },
+    ...subjectCodes.flatMap(c => [
+      { key: `${c}_UA`,    label: `${c}_UA`    },
+      { key: `${c}_CA`,   label: `${c}_CA`    },
+      { key: `${c}_Total`, label: `${c}_Total` },
+    ]),
+    { key: "finalTotal", label: "Final Total" },
+    { key: "sgpa",       label: "SGPA"        },
+    { key: "result",     label: "Result"      },
+  ];
+}
+
+// â”€â”€â”€ PDF â†’ IMAGES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function pdfToImages(buffer) {
   const pdf  = await pdfjsLib.getDocument({ data: buffer }).promise;
   const imgs = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
-
-    // Try scale 2.0 first; fall back to 1.5 if the base64 is too large for Groq (~4 MB limit)
     const renderAt = async (scale, quality) => {
-      const vp     = page.getViewport({ scale });
+      const vp = page.getViewport({ scale });
       const canvas = document.createElement("canvas");
-      canvas.width  = vp.width;
-      canvas.height = vp.height;
+      canvas.width = vp.width; canvas.height = vp.height;
       await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
       return canvas.toDataURL("image/jpeg", quality).split(",")[1];
     };
-
     let b64 = await renderAt(2.0, 0.80);
-    // base64 length * 0.75 ≈ bytes; Groq rejects images > ~4 MB
-    if (b64.length * 0.75 > 4 * 1024 * 1024) {
-      b64 = await renderAt(1.5, 0.75); // fallback: smaller + more compressed
-    }
+    if (b64.length * 0.75 > 4 * 1024 * 1024) b64 = await renderAt(1.5, 0.75);
     imgs.push(b64);
   }
   return imgs;
 }
 
-
+// â”€â”€â”€ CSV DOWNLOAD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function downloadCSV(rows, columns) {
-  const lines = [columns.map(c => c.label).join(",")];
+  const lines = [columns.map(c => `"${c.label}"`).join(",")];
   rows.forEach(row =>
-    lines.push(columns.map(c => `"${(row[c.key] ?? "").toString().replace(/"/g, '""')}"`).join(","))
+    lines.push(columns.map(c => `"${(row[c.key] ?? "").toString().replace(/"/g, '""')}"` ).join(","))
   );
-  const a  = document.createElement("a");
-  a.href   = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
   a.download = "marksheet_results.csv";
   a.click();
 }
 
+// â”€â”€â”€ STYLES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;600;700&display=swap');
   *{box-sizing:border-box;} body{margin:0;background:#0b0f1a;}
@@ -286,6 +363,7 @@ const CSS = `
   .fi{animation:fi .4s ease;} @keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 `;
 
+// â”€â”€â”€ UI COMPONENTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function Badge({ status }) {
   if (status === "idle") return null;
   const s = {
@@ -301,18 +379,24 @@ function Badge({ status }) {
   );
 }
 
-function Header({ status, rateLimit, onClearKey }) {
+function Header({ status, meta, rateLimit, onClearKey }) {
   const used = rateLimit.limit > 0 ? rateLimit.limit - rateLimit.remaining : 0;
   const pct  = rateLimit.limit > 0 ? Math.min(100, Math.round((used / rateLimit.limit) * 100)) : 0;
   const barC = pct > 90 ? "#f87171" : pct > 70 ? "#fbbf24" : "#34d399";
   return (
     <div style={{ background:"linear-gradient(90deg,#0f172a,#1a1f3a)", borderBottom:"1px solid #1e293b", padding:"14px 32px" }}>
-      <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:16, flexWrap:"wrap" }}>
         <div style={{ width:40, height:40, background:"linear-gradient(135deg,#6366f1,#8b5cf6)",
-          borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>📋</div>
+          borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>ðŸ“‹</div>
         <div>
-          <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:700, fontSize:20, color:"#f1f5f9" }}>Marksheet Extractor</div>
-          <div style={{ fontSize:11, color:"#64748b", letterSpacing:".05em" }}>PDF → AI VISION → STRUCTURED DATA → CSV</div>
+          <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:700, fontSize:20, color:"#f1f5f9" }}>
+            Marksheet Extractor
+          </div>
+          <div style={{ fontSize:11, color:"#64748b", letterSpacing:".05em" }}>
+            {meta?.semester
+              ? `${meta.semester}${meta.branch ? " Â· " + meta.branch : ""}${meta.college ? " Â· " + meta.college : ""}`
+              : "PDF â†’ AI VISION â†’ STRUCTURED DATA â†’ CSV Â· Any Semester Â· Any Branch"}
+          </div>
         </div>
         {rateLimit.limit > 0 && (
           <div style={{ flex:1, maxWidth:260, marginLeft:20 }}>
@@ -331,7 +415,7 @@ function Header({ status, rateLimit, onClearKey }) {
             <button id="change-api-key-btn" onClick={onClearKey}
               style={{ background:"transparent", border:"1px solid #334155", borderRadius:6, padding:"5px 10px",
                 color:"#64748b", fontSize:11, cursor:"pointer", fontFamily:"'DM Mono',monospace" }}>
-              🔑 Change Key
+              ðŸ”‘ Change Key
             </button>
           )}
         </div>
@@ -346,14 +430,14 @@ function ApiKeySetup({ onSave }) {
   return (
     <div style={{ maxWidth:560, margin:"60px auto", padding:"0 24px" }}>
       <div style={{ background:"#111827", border:"1px solid #1e293b", borderRadius:16, padding:32, textAlign:"center" }}>
-        <div style={{ fontSize:40, marginBottom:16 }}>🔑</div>
+        <div style={{ fontSize:40, marginBottom:16 }}>ðŸ”‘</div>
         <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:700, fontSize:20, color:"#f1f5f9", marginBottom:8 }}>Groq API Key Required</div>
         <div style={{ fontSize:13, color:"#64748b", marginBottom:6, lineHeight:1.7 }}>
-          Groq is <strong style={{ color:"#34d399" }}>100% free</strong> — no credit card, no region restrictions.
+          Groq is <strong style={{ color:"#34d399" }}>100% free</strong> â€” no credit card, no region restrictions.
         </div>
         <div style={{ fontSize:13, color:"#64748b", marginBottom:24, lineHeight:1.7 }}>
           Get your key at <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer"
-            style={{ color:"#818cf8", textDecoration:"none" }}>console.groq.com/keys</a> → Sign up → Create API Key
+            style={{ color:"#818cf8", textDecoration:"none" }}>console.groq.com/keys</a> â†’ Sign up â†’ Create API Key
         </div>
         <div style={{ display:"flex", gap:8 }}>
           <input id="groq-api-key-input" type="password" value={key}
@@ -365,7 +449,7 @@ function ApiKeySetup({ onSave }) {
             style={{ background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", border:"none",
               borderRadius:8, padding:"10px 20px", fontSize:13, fontFamily:"'Space Grotesk',sans-serif",
               fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" }}>
-            Save & Continue
+            Save &amp; Continue
           </button>
         </div>
         <div style={{ fontSize:11, color:"#334155", marginTop:12 }}>Key saved in browser only (localStorage).</div>
@@ -374,6 +458,7 @@ function ApiKeySetup({ onSave }) {
   );
 }
 
+// â”€â”€â”€ MAIN COMPONENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export default function MarksheetExtractor() {
   const [apiKey,   setApiKey]   = useState(() => localStorage.getItem("groq_api_key") || "");
   const [status,   setStatus]   = useState("idle");
@@ -396,27 +481,16 @@ export default function MarksheetExtractor() {
     try {
       const buf = await file.arrayBuffer();
 
-      setProgress("Reading embedded PDF text...");
-      const textExtraction = await extractTextMarksheet(buf.slice(0));
-      if (textExtraction.students.length > 0) {
-        setMeta(textExtraction.meta);
-        setRows(textExtraction.students);
-        setStatus("success");
-        setProgress("");
-        setBatch({ cur:0, tot:0 });
-        return;
-      }
-
-      setProgress("Rendering pages...");
+      // â”€â”€ AI vision path â€” always used (reliable for any semester/branch) â”€â”€
+      setProgress("Rendering pages for AI...");
       const imgs = await pdfToImages(buf);
-
       const batches = [];
       for (let i = 0; i < imgs.length; i += BATCH_SIZE) batches.push(imgs.slice(i, i + BATCH_SIZE));
       setBatch({ cur:0, tot:batches.length });
 
       for (let b = 0; b < batches.length; b++) {
         setBatch({ cur: b + 1, tot: batches.length });
-        setProgress(`Pages ${b * BATCH_SIZE + 1}–${Math.min((b + 1) * BATCH_SIZE, imgs.length)} of ${imgs.length}`);
+        setProgress(`Pages ${b * BATCH_SIZE + 1}â€“${Math.min((b + 1) * BATCH_SIZE, imgs.length)} of ${imgs.length}`);
 
         const content = [
           { type:"text", text:PROMPT },
@@ -430,10 +504,10 @@ export default function MarksheetExtractor() {
             headers: { "Content-Type":"application/json", "Authorization":`Bearer ${apiKey}` },
             body:    JSON.stringify({
               model: GROQ_MODEL,
-              max_tokens: 4096,
+              max_tokens: 8192,
               temperature: 0,
               messages: [
-                { role:"system", content:"You extract marksheet data from attached images and return only strict JSON." },
+                { role:"system", content:"You extract marksheet data from university result images and return only strict JSON. You adapt to any semester, branch, or subject count automatically." },
                 { role:"user", content },
               ],
             }),
@@ -444,35 +518,26 @@ export default function MarksheetExtractor() {
           const rem = parseInt(res.headers.get("x-ratelimit-remaining-tokens") || "0");
           if (lim > 0) setRl({ limit: lim, remaining: rem });
 
+          // Rate limit handling
           if (res.status === 429) {
-            const errMsg    = data?.error?.message || "";
-            const limMatch  = errMsg.match(/Limit\s+([\d]+)/i);
-            const usedMatch = errMsg.match(/Used\s+([\d]+)/i);
-            if (limMatch && usedMatch) {
-              const parsedLim  = parseInt(limMatch[1]);
-              const parsedUsed = parseInt(usedMatch[1]);
-              setRl({ limit: parsedLim, remaining: parsedLim - parsedUsed });
-            }
+            const errMsg   = data?.error?.message || "";
+            const limMatch = errMsg.match(/Limit\s+([\d]+)/i);
+            const useMatch = errMsg.match(/Used\s+([\d]+)/i);
+            if (limMatch && useMatch) setRl({ limit:parseInt(limMatch[1]), remaining:parseInt(limMatch[1])-parseInt(useMatch[1]) });
             const m = errMsg.match(/try again in ([\d.]+)s/i);
-            const waitSeconds = m ? Math.ceil(parseFloat(m[1])) + 2 : 15;
-            for (let s = waitSeconds; s > 0; s--) {
-              setProgress(`Rate limited — retrying in ${s}s...`);
-              await wait(1000);
-            }
-            setProgress(`Pages ${b * BATCH_SIZE + 1}–${Math.min((b + 1) * BATCH_SIZE, imgs.length)} of ${imgs.length}`);
+            const ws = m ? Math.ceil(parseFloat(m[1])) + 2 : 15;
+            for (let s = ws; s > 0; s--) { setProgress(`Rate limited â€” retrying in ${s}s...`); await wait(1000); }
+            setProgress(`Pages ${b * BATCH_SIZE + 1}â€“${Math.min((b + 1) * BATCH_SIZE, imgs.length)} of ${imgs.length}`);
             continue;
           }
 
+          // Transient error retry
           if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
-            attempt += 1;
+            attempt++;
             const retryAfter = parseInt(res.headers.get("retry-after") || "0");
             const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(30000, 2500 * attempt * attempt);
-            const seconds = Math.ceil(delay / 1000);
-            for (let s = seconds; s > 0; s--) {
-              setProgress(`Batch ${b + 1} hit HTTP ${res.status} — retry ${attempt}/${MAX_RETRIES} in ${s}s...`);
-              await wait(1000);
-            }
-            setProgress(`Pages ${b * BATCH_SIZE + 1}–${Math.min((b + 1) * BATCH_SIZE, imgs.length)} of ${imgs.length}`);
+            const secs = Math.ceil(delay / 1000);
+            for (let s = secs; s > 0; s--) { setProgress(`HTTP ${res.status} â€” retry ${attempt}/${MAX_RETRIES} in ${s}s...`); await wait(1000); }
             continue;
           }
 
@@ -484,18 +549,6 @@ export default function MarksheetExtractor() {
           const text = data?.choices?.[0]?.message?.content || "";
           if (!text) throw new Error(`Empty response for batch ${b + 1}.`);
 
-          // Robust JSON extraction — handles markdown, comments, unquoted keys, single-quoted keys, trailing commas
-          const cleanJSON = (raw) => stripJsonComments(extractJsonCandidate(raw))
-            .replace(/```json\s*/gi, "").replace(/```\s*/g, "")   // strip markdown fences
-            .replace(/[\u2018\u2019]/g, "'")                       // smart single quotes → straight
-            .replace(/[\u201C\u201D]/g, '"')                       // smart double quotes → straight
-            .replace(/,\s*([}\]])/g, "$1")                        // trailing commas before } or ]
-            .replace(/([{,]\s*)'([^']+)'\s*:/g, '$1"$2":')        // 'key': → "key":
-            .replace(/([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*:/g, '$1"$2":') // unquoted key: → "key":
-            // eslint-disable-next-line no-control-regex
-            .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, " ")  // strip control chars (keep \n \r)
-            .trim();
-
           const cleaned = cleanJSON(text);
           const jMatch  = cleaned.match(/\{[\s\S]*\}/);
           if (!jMatch) throw new Error(`No JSON found in batch ${b + 1} response.`);
@@ -504,34 +557,30 @@ export default function MarksheetExtractor() {
           try {
             parsed = JSON.parse(jMatch[0]);
           } catch (e1) {
-            // Last resort: aggressive comma fix + log snippet for debugging
-            const snippet = jMatch[0].slice(Math.max(0, (e1.message.match(/position (\d+)/)?.[1] ?? 50) - 30), (parseInt(e1.message.match(/position (\d+)/)?.[1] ?? 50) + 30));
-            console.error(`[Batch ${b + 1}] JSON error near: ...${snippet}...`);
-            console.error(`[Batch ${b + 1}] Full raw response:\n`, text);
+            console.error(`[Batch ${b + 1}] Raw response:\n`, text);
             const sanitised = jMatch[0].replace(/,\s*([}\]])/g, "$1");
             try { parsed = JSON.parse(sanitised); }
-            catch (e2) { throw new Error(`JSON parse failed (batch ${b + 1}): ${e2.message} — see console for raw response`); }
+            catch (e2) { throw new Error(`JSON parse failed (batch ${b + 1}): ${e2.message}`); }
           }
 
-          if (b === 0 && parsed.meta) {
-            extractedMeta = parsed.meta;
-            setMeta(extractedMeta);
-          }
+          if (b === 0 && parsed.meta) { extractedMeta = parsed.meta; setMeta(parsed.meta); }
           if (Array.isArray(parsed.students)) {
             allStudents = [...allStudents, ...parsed.students];
-            setRows(allStudents);
+            // Normalize after each batch so the table updates live
+            setRows(normalizeStudents(allStudents));
           }
           done = true;
-
         }
 
         if (b < batches.length - 1) await wait(1000);
       }
 
-      setMeta(extractedMeta); setRows(allStudents); setStatus("success");
+      const finalNorm = normalizeStudents(allStudents);
+      setMeta(extractedMeta); setRows(finalNorm); setStatus("success");
       setProgress(""); setBatch({ cur:0, tot:0 });
+
     } catch (err) {
-      if (allStudents.length > 0) setRows(allStudents);
+      if (allStudents.length > 0) setRows(normalizeStudents(allStudents));
       if (extractedMeta) setMeta(extractedMeta);
       setError(err.message || "Extraction failed");
       setStatus("error"); setProgress(""); setBatch({ cur:0, tot:0 });
@@ -547,21 +596,20 @@ export default function MarksheetExtractor() {
   if (!apiKey) return (
     <div style={{ fontFamily:"'DM Mono',monospace", minHeight:"100vh", background:"#0b0f1a", color:"#e2e8f0" }}>
       <style>{CSS}</style>
-      <Header status="idle" rateLimit={{ limit:0, remaining:0 }} onClearKey={null}/>
+      <Header status="idle" meta={null} rateLimit={{ limit:0, remaining:0 }} onClearKey={null}/>
       <ApiKeySetup onSave={setApiKey}/>
     </div>
   );
 
-  const batchPct = batch.tot > 0 ? Math.round((batch.cur / batch.tot) * 100) : 0;
-
-  // Derive columns from actual extracted data
+  const batchPct    = batch.tot > 0 ? Math.round((batch.cur / batch.tot) * 100) : 0;
   const subjectCodes = getSubjectCodes(rows);
   const columns      = buildColumns(subjectCodes);
 
   return (
     <div style={{ fontFamily:"'DM Mono',monospace", minHeight:"100vh", background:"#0b0f1a", color:"#e2e8f0" }}>
       <style>{CSS}</style>
-      <Header status={status} rateLimit={rl} onClearKey={() => { localStorage.removeItem("groq_api_key"); setApiKey(""); }}/>
+      <Header status={status} meta={meta} rateLimit={rl}
+        onClearKey={() => { localStorage.removeItem("groq_api_key"); setApiKey(""); }}/>
 
       <div style={{ padding:"28px 32px" }}>
 
@@ -591,18 +639,20 @@ export default function MarksheetExtractor() {
                   </div>
                 </div>
               )}
-              {fileName && <div style={{ color:"#334155", fontSize:11 }}>📎 {fileName}</div>}
+              {fileName && <div style={{ color:"#334155", fontSize:11 }}>ðŸ“Ž {fileName}</div>}
             </div>
           ) : (
             <>
-              <div style={{ fontSize:36, marginBottom:12 }}>📄</div>
+              <div style={{ fontSize:36, marginBottom:12 }}>ðŸ“„</div>
               <div style={{ fontFamily:"'Space Grotesk',sans-serif", fontWeight:600, fontSize:16, color:"#cbd5e1", marginBottom:6 }}>
-                {fileName && status === "success" ? `📎 ${fileName}` : "Drop your Marksheet PDF here"}
+                {fileName && status === "success" ? `ðŸ“Ž ${fileName}` : "Drop your Marksheet PDF here"}
               </div>
-              <div style={{ fontSize:12, color:"#475569" }}>or click to browse · Gondwana University tabulation register supported</div>
+              <div style={{ fontSize:12, color:"#475569" }}>
+                or click to browse Â· Works for any semester (1â€“8) Â· any branch Â· any subject count
+              </div>
               <div style={{ marginTop:10, display:"inline-block", background:"rgba(52,211,153,.08)",
                 border:"1px solid rgba(52,211,153,.2)", borderRadius:6, padding:"3px 10px", fontSize:11, color:"#34d399" }}>
-                Powered by Groq · Llama 4 Scout Vision ⚡
+                Powered by Groq Â· Llama 4 Scout Vision âš¡
               </div>
             </>
           )}
@@ -612,12 +662,12 @@ export default function MarksheetExtractor() {
         {error && (
           <div style={{ background:"rgba(239,68,68,.08)", border:"1px solid rgba(239,68,68,.25)",
             borderRadius:10, padding:"12px 16px", marginBottom:20, color:"#fca5a5", fontSize:13 }}>
-            ⚠️ {error}
+            âš ï¸ {error}
           </div>
         )}
 
         {/* Meta */}
-        {meta && (
+        {meta && Object.values(meta).some(Boolean) && (
           <div className="fi glow" style={{ background:"#111827", border:"1px solid #1e293b", borderRadius:12,
             padding:"16px 20px", marginBottom:24, display:"flex", gap:32, flexWrap:"wrap" }}>
             {Object.entries(meta).map(([k, v]) => v && (
@@ -626,6 +676,14 @@ export default function MarksheetExtractor() {
                 <div style={{ fontSize:13, color:"#cbd5e1", fontFamily:"'Space Grotesk',sans-serif", fontWeight:500 }}>{v}</div>
               </div>
             ))}
+            {subjectCodes.length > 0 && (
+              <div>
+                <div style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:".08em", marginBottom:3 }}>Subjects Detected</div>
+                <div style={{ fontSize:13, color:"#a5b4fc", fontFamily:"'DM Mono',monospace", fontWeight:500 }}>
+                  {subjectCodes.length} ({subjectCodes.join(", ")})
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -640,7 +698,7 @@ export default function MarksheetExtractor() {
                 style={{ background:"linear-gradient(135deg,#6366f1,#8b5cf6)", color:"#fff", border:"none",
                   borderRadius:8, padding:"8px 18px", fontSize:13, fontFamily:"'Space Grotesk',sans-serif",
                   fontWeight:600, cursor:"pointer" }}>
-                ⬇️ Download CSV
+                â¬‡ï¸ Download CSV
               </button>
             </div>
             <div style={{ overflowX:"auto", border:"1px solid #1e293b", borderRadius:12 }}>
@@ -676,10 +734,10 @@ export default function MarksheetExtractor() {
                         <td style={{ padding:"8px 12px", color:"#e2e8f0", whiteSpace:"nowrap", fontFamily:"'Space Grotesk',sans-serif" }}>{row.name}</td>
                         <td style={{ padding:"8px 12px", color:"#94a3b8", whiteSpace:"nowrap" }}>{row.motherName}</td>
                         {subjectCodes.map(code => [
-                          <td key={`${code}_UA`} style={{ padding:"8px 8px", color:"#94a3b8", textAlign:"center" }}>{row[`${code}_UA`] ?? "—"}</td>,
-                          <td key={`${code}_CA`} style={{ padding:"8px 8px", color:"#94a3b8", textAlign:"center" }}>{row[`${code}_CA`] ?? "—"}</td>,
+                          <td key={`${code}_UA`}    style={{ padding:"8px 8px", color:"#94a3b8", textAlign:"center" }}>{row[`${code}_UA`]    ?? "â€”"}</td>,
+                          <td key={`${code}_CA`}    style={{ padding:"8px 8px", color:"#94a3b8", textAlign:"center" }}>{row[`${code}_CA`]    ?? "â€”"}</td>,
                           <td key={`${code}_Total`} style={{ padding:"8px 8px", color:"#c7d2fe", textAlign:"center",
-                            fontWeight:500, borderRight:"1px solid #1e293b" }}>{row[`${code}_Total`] ?? "—"}</td>,
+                            fontWeight:500, borderRight:"1px solid #1e293b" }}>{row[`${code}_Total`] ?? "â€”"}</td>,
                         ])}
                         <td style={{ padding:"8px 12px", color:"#34d399", fontWeight:600, textAlign:"center" }}>{row.finalTotal}</td>
                         <td style={{ padding:"8px 12px", color:"#fbbf24", fontWeight:600, textAlign:"center" }}>{row.sgpa}</td>
@@ -692,7 +750,7 @@ export default function MarksheetExtractor() {
               </table>
             </div>
             <div style={{ marginTop:10, fontSize:11, color:"#334155", textAlign:"right" }}>
-              EC = Exempted/Carry-over · *1/*2 = Grace marks applied
+              EC = Exempted/Carry-over Â· 0AB = Absent Â· *n = Grace marks Â· Columns auto-detected from PDF
             </div>
           </div>
         )}

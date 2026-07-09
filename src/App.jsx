@@ -1,5 +1,5 @@
-import MarksheetExtractor from './marksheet_extractor.jsx'
+import MarksheetExtractorText from './marksheet_extractor_text.jsx'
 
 export default function App() {
-  return <MarksheetExtractor />
+  return <MarksheetExtractorText />
 }
